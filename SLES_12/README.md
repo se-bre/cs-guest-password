@@ -10,3 +10,6 @@
 
 	chmod +x /usr/bin/cloud-set-guest-password
 
+---
+**hint** at the moment only working for IPv4
+
