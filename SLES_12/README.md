@@ -6,6 +6,10 @@
 
 	systemctl daemon-reload
 
+enable service
+
+	systemctl enable cloud-set-guest-password.service
+
 `/usr/bin/cloud-set-guest-password`
 
 	chmod +x /usr/bin/cloud-set-guest-password
