@@ -42,7 +42,7 @@ move cloudstack-init to `/usr/bin/cloudstack-init` and adjust permissions
 
 show service logs
 
-		journalctl -u cloudstack-init.service
+	journalctl -u cloudstack-init.service
 
 ---
 
