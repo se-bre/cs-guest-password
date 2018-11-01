@@ -1,0 +1,203 @@
+#!/bin/bash
+# Copyright (c) 2013 Apache CloudStack
+#
+# Author: Apache CloudStack
+# Modified by: se_bre (Sebastian Bretschneider)
+#
+# this script will reset root password, generate missing ssh host keys and set hostname in Apache CloudStack Environments on Ubuntu 18.04 LTS
+#
+
+# Add your DHCP lease folders here
+DHCP_FOLDERS="/var/lib/dhcpcd/* /run/wicked/* /var/lib/dhcp/* /run/systemd/netif/leases/*"
+
+password_received=0
+file_count=0
+error_count=0
+
+echo "Starting cloudstack-init" | systemd-cat -t cloud -p info
+
+function cs_reset-password () {
+for DHCP_FILE in $DHCP_FOLDERS; do
+    if [ -f $DHCP_FILE ]; then
+        file_count=$((file_count+1))
+        . $DHCP_FILE > /dev/null 2>&1
+
+        PASSWORD_SERVER_IP=$SERVER_ADDRESS
+
+        if [ -n "$PASSWORD_SERVER_IP" ]; then
+            echo "Found password server IP $PASSWORD_SERVER_IP in $DHCP_FILE"
+            echo "Sending request to password server at $PASSWORD_SERVER_IP"
+            password=$(wget -q -t 3 -T 20 -O - --header "DomU_Request: send_my_password" $PASSWORD_SERVER_IP:8080)
+            password=$(echo $password | tr -d '\r')
+
+            if [ $? -eq 0 ]; then
+                echo "Got response from server at $PASSWORD_SERVER_IP"
+
+                case $password in
+
+                "")                                     echo "Password server at $PASSWORD_SERVER_IP did not have any password for the VM"
+                                    continue
+                                    ;;
+
+                "bad_request")          echo "VM sent an invalid request to password server at $PASSWORD_SERVER_IP"
+                                    error_count=$((error_count+1))
+                                    continue
+                                    ;;
+
+                "saved_password")       echo "VM has already saved a password from the password server at $PASSWORD_SERVER_IP"
+                                    continue
+                                    ;;
+
+                *)                                      echo "VM got a valid password from server at $PASSWORD_SERVER_IP"
+                                    password_received=1
+                                    break
+                                    ;;
+
+                esac
+            else
+                echo "Failed to send request to password server at $PASSWORD_SERVER_IP"
+                error_count=$((error_count+1))
+            fi
+        else
+            echo "Could not find password server IP in $DHCP_FILE"
+            error_count=$((error_count+1))
+        fi
+    fi
+done
+
+if [[ "$password_received" == "0" ]]
+then
+    if [ "$error_count" == "$file_count" ]; then
+        echo "Failed to get password from any server"
+    else
+        echo "Did not need to change password."
+    fi
+fi
+
+if [[ "$password_received" != "0" ]]
+then
+        echo "Changing password ..."
+        echo root:$password | chpasswd
+
+        if [ $? -gt 0 ]; then
+            usermod -p `mkpasswd -m SHA-512 $password` $user
+
+            if [ $? -gt 0 ]; then
+                echo "Failed to change password for user $user"
+                exit 1
+            else
+                echo "Successfully changed password for user $user"
+            fi
+        fi
+
+        echo "Sending acknowledgment to password server at $PASSWORD_SERVER_IP"
+        wget -t 3 -T 20 -O - --header "DomU_Request: saved_password" $PASSWORD_SERVER_IP:8080 > /dev/null 2>&1
+fi
+}
+
+function cs_ssh-keys () {
+echo "checking SSH server keys"
+ssh_keys_created=0
+if [[ -e /etc/ssh/ssh_host_ecdsa_key ]]
+then
+        echo "ecdsa key present"
+else
+        echo "create ecdsa key"
+        rm -rf /etc/ssh/*ecdsa_key* 2>&1
+        ssh-keygen -f /etc/ssh/ssh_host_ecdsa_key -N '' -t ecdsa -b521 > /dev/null  2>&1
+        ssh_keys_created=$(($ssh_keys_created+1))
+fi
+if [[ -e /etc/ssh/ssh_host_ed25519_key ]]
+then
+        echo "ed25519 key present"
+else
+        echo "create ed25519 key"
+        rm -rf /etc/ssh/*ed22519_key*  2>&1
+        ssh-keygen -f /etc/ssh/ssh_host_ed25519_key -N '' -t ed25519 > /dev/null  2>&1
+        ssh_keys_created=$(($ssh_keys_created+1))
+fi
+if [[ -e /etc/ssh/ssh_host_rsa_key ]]
+then
+        echo "rsa key present"
+else
+        echo "create rsa key"
+        rm -rf /etc/ssh/*rsa_key*  2>&1
+        ssh-keygen -f /etc/ssh/ssh_host_rsa_key -N '' -t rsa > /dev/null 2>&1
+        ssh_keys_created=$(($ssh_keys_created+1))
+fi
+
+if [[ "$ssh_keys_created" == "0" ]]
+then
+        echo "no ssh keys created"
+else
+        echo "${ssh_keys_created} ssh keys created - restarting SSH"
+        systemctl restart sshd.service 2>&1
+fi
+}
+
+function cs_set-hostname () {
+
+echo "checking hostname"
+old_hostname=$(hostname -s)
+old_domain=$(grep '127.0.0.1' /etc/hosts | grep -Ev "^127.0.0.1(.)*localhost$" |awk '{print $2}'|sed 's/\ //g')
+lease_file_count=0
+hostname_changed=False
+
+for DHCP_FILE in $DHCP_FOLDERS; do
+
+        if [[ -f $DHCP_FILE ]]
+        then
+                . $DHCP_FILE > /dev/null 2>&1
+
+                if [[ -z ${HOSTNAME+x} || -z ${DOMAINNAME+x} ]]
+                then
+                        found_fqdn_in_leasef=False
+                else
+                        found_fqdn_in_leasef=True
+                fi
+
+                lease_file_count=$(($lease_file_count+1))
+                if [[ $found_fqdn_in_leasef = True && $hostname_changed = False ]]
+                then
+                        cs_fqdn=$HOSTNAME.$DOMAINNAME
+
+                        if [[ "$old_hostname" == "localhost" || "$old_domain" != "$cs_fqdn" ]]
+                          then
+                            echo "Wrong fqdn detected. Changing hostname and adding hosts."
+                            echo "Hostname: $HOSTNAME"
+                            echo "Domain: $DOMAINNAME"
+                            echo "IP: $ADDRESS"
+
+                            echo "Update /etc/hosts"
+                            echo -e "127.0.0.1\tlocalhost" > /etc/hosts
+                            echo -e "127.0.0.1\t${cs_fqdn}\t${HOSTNAME}\n" >> /etc/hosts
+                            echo -e "${ADDRESS}\t${cs_fqdn}\t${HOSTNAME}\n" >> /etc/hosts
+
+                            echo "Rename Host"
+                            echo $HOSTNAME > /etc/hostname
+                            hostname -b -F /etc/hostname
+                            echo $HOSTNAME > /proc/sys/kernel/hostname
+
+                        fi
+                        hostname_changed=True
+                fi
+        fi
+done
+
+if [[ "$lease_file_count" -gt 1 ]]
+then
+        echo "found ${lease_file_count} dhcp lease files ... set values from first file with fqdn defined"
+fi
+if [[ "$lease_file_count" -eq 0 ]]
+then
+        echo "no dhcp lease file found - couldn't set hostname"
+fi
+}
+
+cs_reset-password | systemd-cat -t cloud -p info
+cs_ssh-keys | systemd-cat -t cloud -p info
+cs_set-hostname | systemd-cat -t cloud -p info
+
+echo -n "Shutting down cloudstack-init" | systemd-cat -t cloud -p info
+
+exit 0
